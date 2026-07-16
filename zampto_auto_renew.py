@@ -164,9 +164,10 @@ def launch_playwright():
     logger.info(f"[Playwright] 启动 Chromium (headless={headless})...")
 
     pw = sync_playwright().start()
-    browser = pw.chromium.launch(
-        headless=headless,
-        args=[
+    use_proxy = os.environ.get("USE_PROXY", "").lower() == "true"
+    launch_args = {
+        "headless": headless,
+        "args": [
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
@@ -178,7 +179,12 @@ def launch_playwright():
             "--disable-web-security",
             "--disable-features=BlockInsecurePrivateNetworkRequests",
         ],
-    )
+    }
+    if use_proxy:
+        launch_args["proxy"] = {"server": "socks5://127.0.0.1:10808"}
+        logger.info("[Playwright] 使用代理: socks5://127.0.0.1:10808")
+
+    browser = pw.chromium.launch(**launch_args)
     context = browser.new_context(
         viewport={"width": 1280, "height": 720},
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
