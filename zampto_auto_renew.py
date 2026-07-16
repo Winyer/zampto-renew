@@ -3,23 +3,15 @@
 """
 Zampto 自动续期脚本
 ====================
-自动登录 Zampto 并续期 Free-4 服务器，每小时一次。
+使用 Playwright 通过 CDP 连接 CentBrowser 自动登录 Zampto 并续期服务器。
+Free-4 需要每小时续期一次。
 
-支持两种浏览器模式（通过环境变量 BROWSER_MODE 切换）：
-  - centbrowser (默认): 通过 CDP 连接本地 CentBrowser，适合 Windows 本地运行
-  - playwright: 使用 Playwright 自带 Chromium，适合 GitHub Actions / Linux / Docker
+方案: 通过 subprocess 启动 CentBrowser (带 --remote-debugging-port),
+然后 Playwright 通过 CDP 连接控制浏览器完成续期操作。
 
 用法:
-  python zampto_auto_renew.py              # 单次执行
-  python zampto_auto_renew.py loop         # 持续运行（每小时）
-
-环境变量:
-  BROWSER_MODE        centbrowser | playwright (默认: 自动检测)
-  CENTBROWSER_PATH    CentBrowser 可执行文件路径 (仅 centbrowser 模式)
-  CDP_PORT            CDP 端口 (默认: 9222)
-  ZAMPTO_EMAIL        登录邮箱 (默认从配置读取)
-  ZAMPTO_PASSWORD     登录密码 (默认从配置读取)
-  SERVER_IDS          逗号分隔的服务器 ID 列表
+  python zampto_auto_renew.py          # 单次执行
+  python zampto_auto_renew.py loop     # 持续运行（每小时）
 
 依赖: pip install playwright
 """
@@ -32,7 +24,7 @@ import random
 import logging
 import traceback
 import subprocess
-import urllib.request
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -40,27 +32,22 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 # ===================== 配置 =====================
 
-EMAIL = os.environ.get("ZAMPTO_EMAIL", "x@end.tw")
-PASSWORD = os.environ.get("ZAMPTO_PASSWORD", "RS0WJV73..")
-SERVER_IDS_STR = os.environ.get("SERVER_IDS", "10852")
-KNOWN_SERVER_IDS = [s.strip() for s in SERVER_IDS_STR.split(",") if s.strip()]
+EMAIL = "x@end.tw"
+PASSWORD = "RS0WJV73.."
 
 BASE_URL = "https://dash.zampto.net"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 FREE_TIER = "Free-4"
 
-# 浏览器模式
-BROWSER_MODE = os.environ.get("BROWSER_MODE", "")
-if not BROWSER_MODE:
-    # 自动检测：Windows 有 CentBrowser 则用 centbrowser，否则用 playwright
-    BROWSER_MODE = "centbrowser" if sys.platform == "win32" and os.path.exists(
-        os.environ.get("CENTBROWSER_PATH", r"C:\Program Files\CentBrowser\Application\chrome.exe")
-    ) else "playwright"
+# 如果知道服务器 ID，可以直接填写（跳过列表页查找）
+# 留空则自动从服务器列表获取
+KNOWN_SERVER_IDS = ["10874"]
 
-CENTBROWSER_PATH = os.environ.get("CENTBROWSER_PATH", r"C:\Program Files\CentBrowser\Application\chrome.exe")
-CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
+# CentBrowser 路径
+CENTBROWSER_PATH = r"C:\Program Files\CentBrowser\Application\chrome.exe"
+CDP_PORT = 9222
 
-# 路径
+# 脚本目录
 SCRIPT_DIR = Path(__file__).parent
 LOG_DIR = SCRIPT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -68,6 +55,8 @@ LOG_FILE = LOG_DIR / "zampto_renew.log"
 STATUS_FILE = SCRIPT_DIR / "renew_status.json"
 SCREENSHOT_DIR = SCRIPT_DIR / "screenshots"
 SCREENSHOT_DIR.mkdir(exist_ok=True)
+
+# 用户数据目录 (用于保存登录状态)
 USER_DATA_DIR = SCRIPT_DIR / "browser_data"
 
 # ===================== 日志 =====================
@@ -82,6 +71,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ===================== 状态管理 =====================
 
 def load_status():
@@ -93,12 +83,14 @@ def load_status():
             pass
     return {}
 
+
 def save_status(status):
     try:
         with open(STATUS_FILE, "w", encoding="utf-8") as f:
             json.dump(status, f, indent=2, ensure_ascii=False)
     except Exception as e:
         logger.error(f"保存状态失败: {e}")
+
 
 def record_renewal(success, message=""):
     status = load_status()
@@ -112,11 +104,12 @@ def record_renewal(success, message=""):
     status["last_success"] = success
     save_status(status)
 
+
 # ===================== 浏览器管理 =====================
 
-def launch_centbrowser():
-    """启动 CentBrowser + CDP 连接，返回 (pw, browser, context, page, proc)"""
-    logger.info(f"[CentBrowser] 启动浏览器 (CDP 端口: {CDP_PORT})...")
+def start_centbrowser():
+    """启动 CentBrowser 并返回进程"""
+    logger.info(f"启动 CentBrowser (CDP 端口: {CDP_PORT})...")
 
     cmd = [
         CENTBROWSER_PATH,
@@ -125,6 +118,7 @@ def launch_centbrowser():
         "--disable-extensions",
         "--disable-component-update",
         "--no-default-browser-check",
+        "--disable-features=AdsBlocklist,SubresourceFilter",
         f"--user-data-dir={USER_DATA_DIR}",
     ]
 
@@ -135,140 +129,31 @@ def launch_centbrowser():
         creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
     )
 
+    # 等待 CDP 端口就绪
+    import urllib.request
     for i in range(30):
         try:
             urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/version", timeout=2)
-            logger.info(f"[CentBrowser] 已就绪 (PID: {proc.pid})")
-            break
+            logger.info(f"CentBrowser 已就绪 (PID: {proc.pid})")
+            return proc
         except Exception:
             time.sleep(1)
-    else:
-        proc.kill()
-        raise RuntimeError("CentBrowser 启动超时")
 
-    pw = sync_playwright().start()
-    browser = pw.chromium.connect_over_cdp(f"http://localhost:{CDP_PORT}")
-    logger.info("[CentBrowser] CDP 连接成功!")
-
-    contexts = browser.contexts
-    context = contexts[0] if contexts else browser.new_context()
-    page = context.new_page()
-    page.wait_for_timeout(2000)
-
-    return pw, browser, context, page, proc
+    raise RuntimeError("CentBrowser 启动超时")
 
 
-def launch_playwright():
-    """使用 Playwright 自带 Chromium，返回 (pw, browser, context, page, None)"""
-    headless = os.environ.get("HEADLESS", "true").lower() != "false"
-    logger.info(f"[Playwright] 启动 Chromium (headless={headless})...")
-
-    pw = sync_playwright().start()
-    use_proxy = os.environ.get("USE_PROXY", "").lower() == "true"
-    # 优先使用系统 Chrome（指纹更真实），fallback 到 Playwright Chromium
-    chrome_paths = [
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/google-chrome",
-        "/opt/google/chrome/chrome",
-    ]
-    exe_path = None
-    for p in chrome_paths:
-        if os.path.exists(p):
-            exe_path = p
-            break
-
-    launch_args = {
-        "headless": headless,
-        "args": [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-first-run",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-        ],
-    }
-    if exe_path:
-        launch_args["executable_path"] = exe_path
-        logger.info(f"[Playwright] 使用系统 Chrome: {exe_path}")
-    if use_proxy:
-        launch_args["proxy"] = {"server": "socks5://127.0.0.1:10808"}
-        logger.info("[Playwright] 使用代理: socks5://127.0.0.1:10808")
-
-    browser = pw.chromium.launch(**launch_args)
-    context = browser.new_context(
-        viewport={"width": 1280, "height": 720},
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-        locale="en-US",
-        timezone_id="America/New_York",
-    )
-    page = context.new_page()
-
-    # 注入 JS 隐藏自动化特征
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-        Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-        window.chrome = { runtime: {} };
-        window.Notification = window.Notification || {};
-        const origQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (p) => (p.name === 'notifications' ? Promise.resolve({state: 'default'}) : origQuery(p));
-        // Fake WebGL vendor
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(p) {
-            if (p === 37445) return 'Intel Inc.';
-            if (p === 37446) return 'Intel Iris Xe Graphics';
-            return getParameter.call(this, p);
-        };
-        // Fake canvas
-        const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-        HTMLCanvasElement.prototype.toDataURL = function(type) {
-            if (this.width > 16 && this.height > 16) {
-                const ctx = this.getContext('2d');
-                if (ctx) ctx.fillText = () => {};
-            }
-            return origToDataURL.call(this, type);
-        };
-    """)
-
-    logger.info("[Playwright] Chromium 启动成功!")
-
-    return pw, browser, context, page, None
-
-
-def stop_browser(pw, browser, context, page, proc):
-    """关闭浏览器"""
+def stop_centbrowser(proc):
+    """停止 CentBrowser"""
     try:
-        page.close()
+        proc.terminate()
+        proc.wait(timeout=10)
     except Exception:
-        pass
-    try:
-        context.close()
-    except Exception:
-        pass
-    try:
-        browser.close()
-    except Exception:
-        pass
-    try:
-        pw.stop()
-    except Exception:
-        pass
-    if proc:
         try:
-            proc.terminate()
-            proc.wait(timeout=10)
+            proc.kill()
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        logger.info("[CentBrowser] 已停止")
+            pass
+    logger.info("CentBrowser 已停止")
+
 
 # ===================== 工具函数 =====================
 
@@ -284,16 +169,18 @@ def take_screenshot(page, name):
 
 
 def remove_adblocker_overlay(page):
-    """移除 Ad Blocker 弹窗"""
-    for _ in range(3):
+    """移除 Ad Blocker 弹窗（多次尝试确保移除）"""
+    for attempt in range(3):
         try:
             page.evaluate(
                 """
                 () => {
                     for (var i = 0; i < 3; i++) {
                         var overlay = document.getElementById('adblocker-overlay');
-                        if (overlay) overlay.remove();
-                        document.querySelectorAll('[role="alertdialog"]').forEach(el => el.remove());
+                        if (overlay) { overlay.remove(); }
+                        document.querySelectorAll('[role="alertdialog"]').forEach(el => {
+                            el.remove();
+                        });
                     }
                 }
                 """
@@ -330,7 +217,7 @@ def js_fill_input(page, css_selector, text):
     )
 
 
-def wait_for_turnstile(page, timeout=120):
+def wait_for_turnstile(page, timeout=60):
     """等待 Cloudflare Turnstile 验证"""
     logger.info("检查 Turnstile 验证...")
     has_turnstile = page.evaluate(
@@ -349,30 +236,29 @@ def wait_for_turnstile(page, timeout=120):
     logger.info("检测到 Turnstile，等待自动通过...")
     start = time.time()
     while time.time() - start < timeout:
-        try:
-            solved = page.evaluate(
-                """
-                () => {
-                    var input = document.querySelector('input[name="cf-turnstile-response"]');
-                    return input && input.value && input.value.length > 20;
-                }
-                """
-            )
-            if solved:
-                logger.info(f"Turnstile 验证通过 ({time.time() - start:.1f}s)")
-                return True
-        except Exception:
-            pass
-        time.sleep(2)
+        solved = page.evaluate(
+            """
+            () => {
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                return input && input.value && input.value.length > 20;
+            }
+            """
+        )
+        if solved:
+            logger.info(f"Turnstile 验证通过 ({time.time() - start:.1f}s)")
+            return True
+        time.sleep(1)
 
     logger.warning("Turnstile 验证超时")
     return False
+
 
 # ===================== 登录 =====================
 
 def login(page):
     """登录 Zampto"""
     logger.info(f"正在打开登录页: {LOGIN_URL}")
+    # 多次重试导航（网络可能间歇性不通）
     for attempt in range(5):
         try:
             page.goto(LOGIN_URL, wait_until="load", timeout=60000)
@@ -394,7 +280,8 @@ def login(page):
     remove_adblocker_overlay(page)
     page.wait_for_timeout(1000)
 
-    # 检查 OTP 页面
+    # 检查是否在 OTP 验证页面（点击 Login 后可能跳到验证码页面）
+    # 如果是，点击 "Back to password login" 回到密码登录
     try:
         back_link = page.locator('text=Back to password login').first
         if back_link.is_visible(timeout=3000):
@@ -422,22 +309,10 @@ def login(page):
     js_fill_input(page, 'input[type="password"]', PASSWORD)
     page.wait_for_timeout(500 + random.randint(0, 500))
 
-    # 随机鼠标移动（模拟真实用户）
-    try:
-        page.mouse.move(random.randint(100, 400), random.randint(100, 400))
-        page.wait_for_timeout(random.randint(300, 800))
-        page.mouse.move(random.randint(500, 900), random.randint(200, 500))
-        page.wait_for_timeout(random.randint(300, 800))
-    except Exception:
-        pass
-
-    # 等待 Turnstile 自动通过
-    wait_for_turnstile(page)
-    page.wait_for_timeout(random.randint(1000, 3000))
-
-    # 点击 Login（精确匹配）
+    # 点击 Login（精确匹配 "Login" 按钮，不匹配 "Login with Email Code"）
     logger.info("正在点击 Login...")
     try:
+        # 使用 JS 精确匹配按钮文本为 "Login" 的按钮
         login_clicked = page.evaluate(
             """
             () => {
@@ -454,7 +329,7 @@ def login(page):
             """
         )
         if not login_clicked:
-            logger.error("未找到 Login 按钮")
+            logger.error("未找到 Login 按钮（精确匹配）")
             take_screenshot(page, "login_no_button")
             return False
     except Exception as e:
@@ -462,29 +337,40 @@ def login(page):
         take_screenshot(page, "login_click_error")
         return False
 
+    # 等待跳转
     logger.info("等待登录跳转...")
-    page.wait_for_timeout(15000)
+    page.wait_for_timeout(10000)
+
     remove_adblocker_overlay(page)
 
-    # 检查是否又到了 OTP
+    # 检查是否又跳到了 OTP 验证页面
     try:
         back_link = page.locator('text=Back to password login').first
         if back_link.is_visible(timeout=3000):
-            logger.info("登录后又到了 OTP 页面，重试...")
+            logger.info("登录后又到了 OTP 页面，点击返回密码登录再试...")
             back_link.click()
             page.wait_for_timeout(3000)
             remove_adblocker_overlay(page)
+
+            # 重新填写
+            logger.info("重新填写表单...")
             js_fill_input(page, 'input[type="email"]', EMAIL)
             page.wait_for_timeout(300)
             js_fill_input(page, 'input[type="password"]', PASSWORD)
             page.wait_for_timeout(300)
+
+            # 点击 Login
+            logger.info("再次点击 Login...")
             login_clicked2 = page.evaluate(
                 """
                 () => {
                     var buttons = document.querySelectorAll('button');
                     for (var i = 0; i < buttons.length; i++) {
                         var txt = (buttons[i].innerText || buttons[i].textContent || '').trim();
-                        if (txt === 'Login') { buttons[i].click(); return true; }
+                        if (txt === 'Login') {
+                            buttons[i].click();
+                            return true;
+                        }
                     }
                     return false;
                 }
@@ -492,45 +378,54 @@ def login(page):
             )
             if not login_clicked2:
                 logger.error("第二次也未找到 Login 按钮")
+                take_screenshot(page, "login_no_button_2")
                 return False
             page.wait_for_timeout(10000)
             remove_adblocker_overlay(page)
     except Exception:
         pass
 
-    if "auth/login" not in page.url:
-        logger.info(f"登录成功! URL: {page.url}")
+    current_url = page.url
+    if "auth/login" not in current_url:
+        logger.info(f"登录成功! URL: {current_url}")
         return True
 
-    logger.error(f"登录失败，URL: {page.url}")
+    logger.error(f"登录失败，URL: {current_url}")
     take_screenshot(page, "login_failed")
     return False
 
-# ===================== Free Tier / GetStarted =====================
+
+# ===================== Free Tier =====================
 
 def handle_free_tier_selection(page):
     if "/freetier/resources" not in page.url:
         return True
+
     logger.info("检测到 Free Tier 选择页面，选择 Free-4...")
     remove_adblocker_overlay(page)
     page.wait_for_timeout(1000)
+
     try:
         free4_btn = page.locator('button:has-text("Free-4")').first
         if free4_btn.is_visible():
             free4_btn.click()
             page.wait_for_timeout(2000)
+
         select_btn = page.locator('button:has-text("Select")').first
         if select_btn.is_visible():
             select_btn.click()
             logger.info("已选择 Free-4")
             page.wait_for_timeout(5000)
+
         remove_adblocker_overlay(page)
         page.wait_for_timeout(2000)
+
         body_text = page.locator('body').inner_text()
         if "Application error" in body_text:
             logger.warning("页面错误，刷新中...")
             page.reload()
             page.wait_for_timeout(5000)
+
         return True
     except Exception as e:
         logger.error(f"Free Tier 选择失败: {e}")
@@ -541,6 +436,7 @@ def handle_free_tier_selection(page):
 def handle_getstarted(page):
     if "/getstarted" not in page.url:
         return True
+
     logger.info("检测到 GetStarted 页面")
     try:
         btn = page.locator('button:has-text("Get Started")').first
@@ -551,7 +447,8 @@ def handle_getstarted(page):
         pass
     return True
 
-# ===================== 导航与续期 =====================
+
+# ===================== 服务器导航 =====================
 
 def safe_goto(page, url, max_retries=3):
     """安全导航：自动检测页面崩溃并重试"""
@@ -559,6 +456,7 @@ def safe_goto(page, url, max_retries=3):
         try:
             page.goto(url, wait_until="load", timeout=60000)
             page.wait_for_timeout(3000)
+            # 检查页面是否崩溃
             body_text = page.locator("body").inner_text()
             if "Application error" in body_text:
                 logger.warning(f"页面崩溃 (尝试 {attempt+1}/{max_retries})，刷新重试...")
@@ -571,6 +469,17 @@ def safe_goto(page, url, max_retries=3):
             page.wait_for_timeout(2000)
     logger.error(f"导航 {url} 失败（已重试 {max_retries} 次）")
     return False
+
+
+def navigate_to_servers(page):
+    logger.info("导航到服务器页面...")
+    if safe_goto(page, f"{BASE_URL}/servers"):
+        if "/servers" in page.url:
+            logger.info("已进入服务器页面")
+            return True
+
+    safe_goto(page, f"{BASE_URL}/homepage")
+    return True
 
 
 def get_server_links(page):
@@ -594,11 +503,14 @@ def get_server_links(page):
         )
     except Exception as e:
         logger.error(f"获取服务器链接失败: {e}")
+
     logger.info(f"找到 {len(links)} 个服务器链接")
     for link in links:
         logger.info(f"  - {link.get('text', 'Unknown')}: {link.get('href', '')}")
     return links
 
+
+# ===================== 续期 =====================
 
 def renew_server(page, server_url, server_name=""):
     logger.info(f"续期服务器: {server_name or server_url}")
@@ -608,6 +520,7 @@ def renew_server(page, server_url, server_name=""):
 
     take_screenshot(page, f"server_page_{server_name}")
 
+    # 点击续期按钮
     renew_result = page.evaluate(
         """
         () => {
@@ -637,10 +550,12 @@ def renew_server(page, server_url, server_name=""):
         return False, "未找到续期按钮"
 
     logger.info(f"已点击续期按钮: {renew_result}")
+
+    # 等待 Turnstile
     wait_for_turnstile(page)
     page.wait_for_timeout(5000)
 
-    # 检查确认弹窗
+    # 检查确认按钮
     try:
         confirm_result = page.evaluate(
             """
@@ -666,6 +581,7 @@ def renew_server(page, server_url, server_name=""):
     except Exception:
         pass
 
+    # 读取结果
     page.wait_for_timeout(3000)
     try:
         result = page.evaluate(
@@ -704,32 +620,45 @@ def renew_server(page, server_url, server_name=""):
     take_screenshot(page, f"renew_result_{server_name}")
     return True, "续期操作已执行（结果不确定）"
 
+
 # ===================== 主逻辑 =====================
 
 def do_renewal():
     """执行一次完整的续期流程"""
-    pw = browser = context = page = proc = None
+    proc = None
     try:
-        # Step 0: 启动浏览器
-        logger.info(f"浏览器模式: {BROWSER_MODE}")
+        # Step 0: 启动 CentBrowser
+        proc = start_centbrowser()
 
-        if BROWSER_MODE == "centbrowser":
-            pw, browser, context, page, proc = launch_centbrowser()
+        # Step 1: 通过 CDP 连接
+        logger.info("通过 CDP 连接浏览器...")
+        pw = sync_playwright().start()
+        browser = pw.chromium.connect_over_cdp(f"http://localhost:{CDP_PORT}")
+        logger.info("CDP 连接成功!")
+
+        # 获取或创建 context
+        contexts = browser.contexts
+        if contexts:
+            context = contexts[0]
         else:
-            pw, browser, context, page, proc = launch_playwright()
+            context = browser.new_context()
 
-        # Step 1: 登录
+        page = context.new_page()
+        page.wait_for_timeout(2000)
+
+        # Step 2: 登录
         if not login(page):
             record_renewal(False, "登录失败")
             return False
 
-        # Step 2: 处理 Free Tier / GetStarted
+        # Step 3: 处理 Free Tier / GetStarted
         handle_free_tier_selection(page)
         handle_getstarted(page)
 
-        # Step 3: 构建服务器 URL 列表
+        # Step 4: 构建服务器 URL 列表
         server_links = []
 
+        # 优先使用已知服务器 ID（直接导航，跳过列表页）
         if KNOWN_SERVER_IDS:
             logger.info(f"使用已知服务器 ID: {KNOWN_SERVER_IDS}")
             for sid in KNOWN_SERVER_IDS:
@@ -738,13 +667,33 @@ def do_renewal():
                     "text": f"Server-{sid}",
                 })
         else:
-            if safe_goto(page, f"{BASE_URL}/servers"):
-                page.wait_for_timeout(3000)
-                server_links = get_server_links(page)
+            # 从服务器列表获取
+            navigate_to_servers(page)
+            page.wait_for_timeout(3000)
+            server_links = get_server_links(page)
+
             if not server_links:
                 logger.info("尝试从 homepage 获取服务器...")
                 safe_goto(page, f"{BASE_URL}/homepage")
-                server_links = get_server_links(page)
+                try:
+                    page.evaluate(
+                        """
+                        () => {
+                            var els = document.querySelectorAll('a, button');
+                            for (var i = 0; i < els.length; i++) {
+                                var txt = (els[i].innerText || els[i].textContent || '').trim().toLowerCase();
+                                if (txt.includes('server') && (txt.includes('overview') || txt.includes('manage'))) {
+                                    els[i].click();
+                                    return;
+                                }
+                            }
+                        }
+                        """
+                    )
+                    page.wait_for_timeout(5000)
+                    server_links = get_server_links(page)
+                except Exception:
+                    pass
 
         if not server_links:
             logger.info("没有找到需要续期的服务器")
@@ -752,7 +701,7 @@ def do_renewal():
             record_renewal(True, "没有需要续期的服务器")
             return True
 
-        # Step 4: 逐个续期
+        # Step 6: 逐个续期
         all_success = True
         for i, server in enumerate(server_links):
             server_url = server.get("href", "")
@@ -770,6 +719,7 @@ def do_renewal():
                 logger.info(f"等待 {wait:.1f} 秒...")
                 page.wait_for_timeout(int(wait * 1000))
 
+        # 记录结果
         result_msg = f"成功续期 {len(server_links)} 个服务器" if all_success else "部分服务器续期失败"
         record_renewal(all_success, result_msg)
         logger.info(f"\n{'='*50}")
@@ -787,7 +737,15 @@ def do_renewal():
         record_renewal(False, f"异常: {str(e)[:200]}")
         return False
     finally:
-        stop_browser(pw, browser, context, page, proc)
+        try:
+            page.close()
+            browser.close()
+            pw.stop()
+        except Exception:
+            pass
+        if proc:
+            stop_centbrowser(proc)
+
 
 # ===================== 持续运行 =====================
 
@@ -820,12 +778,10 @@ def run_loop():
             logger.error(f"循环出错: {e}")
             time.sleep(60)
 
+
 # ===================== 入口 =====================
 
 if __name__ == "__main__":
-    logger.info(f"Zampto 自动续期脚本启动")
-    logger.info(f"浏览器模式: {BROWSER_MODE}")
-
     mode = sys.argv[1] if len(sys.argv) > 1 else "once"
 
     if mode == "loop":
