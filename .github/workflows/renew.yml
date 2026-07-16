@@ -27,12 +27,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      - name: Install Google Chrome
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb wget
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get -f install -y
+          google-chrome --version
+
+      - name: Install Python dependencies
+        run: |
           pip install playwright
-          playwright install chromium
           playwright install-deps chromium
 
       - name: Setup sing-box proxy
