@@ -207,22 +207,33 @@ def launch_playwright():
 
     # 注入 JS 隐藏自动化特征
     page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', { get: () => [{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
         window.chrome = { runtime: {} };
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
+        window.Notification = window.Notification || {};
+        const origQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (p) => (p.name === 'notifications' ? Promise.resolve({state: 'default'}) : origQuery(p));
+        // Fake WebGL vendor
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Intel Inc.';
+            if (p === 37446) return 'Intel Iris Xe Graphics';
+            return getParameter.call(this, p);
+        };
+        // Fake canvas
+        const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL = function(type) {
+            if (this.width > 16 && this.height > 16) {
+                const ctx = this.getContext('2d');
+                if (ctx) ctx.fillText = () => {};
+            }
+            return origToDataURL.call(this, type);
+        };
     """)
 
     logger.info("[Playwright] Chromium 启动成功!")
@@ -411,6 +422,19 @@ def login(page):
     js_fill_input(page, 'input[type="password"]', PASSWORD)
     page.wait_for_timeout(500 + random.randint(0, 500))
 
+    # 随机鼠标移动（模拟真实用户）
+    try:
+        page.mouse.move(random.randint(100, 400), random.randint(100, 400))
+        page.wait_for_timeout(random.randint(300, 800))
+        page.mouse.move(random.randint(500, 900), random.randint(200, 500))
+        page.wait_for_timeout(random.randint(300, 800))
+    except Exception:
+        pass
+
+    # 等待 Turnstile 自动通过
+    wait_for_turnstile(page)
+    page.wait_for_timeout(random.randint(1000, 3000))
+
     # 点击 Login（精确匹配）
     logger.info("正在点击 Login...")
     try:
@@ -439,7 +463,7 @@ def login(page):
         return False
 
     logger.info("等待登录跳转...")
-    page.wait_for_timeout(10000)
+    page.wait_for_timeout(15000)
     remove_adblocker_overlay(page)
 
     # 检查是否又到了 OTP
