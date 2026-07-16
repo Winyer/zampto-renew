@@ -1,0 +1,55 @@
+name: Zampto Auto Renew
+
+on:
+  schedule:
+    # 每小时运行一次（UTC 时间，整点过5分）
+    - cron: '5 * * * *'
+  workflow_dispatch:
+    # 允许手动触发
+
+env:
+  BROWSER_MODE: playwright
+  ZAMPTO_EMAIL: ${{ secrets.ZAMPTO_EMAIL }}
+  ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
+  SERVER_IDS: ${{ secrets.SERVER_IDS }}
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run renewal
+        run: python zampto_auto_renew.py once
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
+          retention-days: 3
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            logs/
+            renew_status.json
+          retention-days: 30
