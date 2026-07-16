@@ -172,13 +172,40 @@ def launch_playwright():
             "--disable-gpu",
             "--disable-extensions",
             "--no-first-run",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-web-security",
+            "--disable-features=BlockInsecurePrivateNetworkRequests",
         ],
     )
     context = browser.new_context(
         viewport={"width": 1280, "height": 720},
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        locale="en-US",
+        timezone_id="America/New_York",
     )
     page = context.new_page()
+
+    # 注入 JS 隐藏自动化特征
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+        window.chrome = { runtime: {} };
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+    """)
+
     logger.info("[Playwright] Chromium 启动成功!")
 
     return pw, browser, context, page, None
