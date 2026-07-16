@@ -165,6 +165,18 @@ def launch_playwright():
 
     pw = sync_playwright().start()
     use_proxy = os.environ.get("USE_PROXY", "").lower() == "true"
+    # 优先使用系统 Chrome（指纹更真实），fallback 到 Playwright Chromium
+    chrome_paths = [
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/opt/google/chrome/chrome",
+    ]
+    exe_path = None
+    for p in chrome_paths:
+        if os.path.exists(p):
+            exe_path = p
+            break
+
     launch_args = {
         "headless": headless,
         "args": [
@@ -172,14 +184,14 @@ def launch_playwright():
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--disable-extensions",
             "--no-first-run",
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-web-security",
-            "--disable-features=BlockInsecurePrivateNetworkRequests",
         ],
     }
+    if exe_path:
+        launch_args["executable_path"] = exe_path
+        logger.info(f"[Playwright] 使用系统 Chrome: {exe_path}")
     if use_proxy:
         launch_args["proxy"] = {"server": "socks5://127.0.0.1:10808"}
         logger.info("[Playwright] 使用代理: socks5://127.0.0.1:10808")
