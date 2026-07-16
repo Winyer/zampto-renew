@@ -160,11 +160,12 @@ def launch_centbrowser():
 
 def launch_playwright():
     """使用 Playwright 自带 Chromium，返回 (pw, browser, context, page, None)"""
-    logger.info("[Playwright] 启动 Chromium (headless)...")
+    headless = os.environ.get("HEADLESS", "true").lower() != "false"
+    logger.info(f"[Playwright] 启动 Chromium (headless={headless})...")
 
     pw = sync_playwright().start()
     browser = pw.chromium.launch(
-        headless=True,
+        headless=headless,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
