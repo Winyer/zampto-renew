@@ -8,6 +8,7 @@ on:
 env:
   BROWSER_MODE: playwright
   HEADLESS: "false"
+  USE_PROXY: "true"
   ZAMPTO_EMAIL: ${{ secrets.ZAMPTO_EMAIL }}
   ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
   SERVER_IDS: ${{ secrets.SERVER_IDS }}
@@ -33,6 +34,46 @@ jobs:
           pip install playwright
           playwright install chromium
           playwright install-deps chromium
+
+      - name: Setup sing-box proxy
+        run: |
+          # Download sing-box
+          curl -sLo /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.11.4/sing-box-1.11.4-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box
+          sudo chmod +x /usr/local/bin/sing-box
+
+          # Generate config
+          cat > /tmp/sing-box.json <<EOF
+          {
+            "inbounds": [
+              {
+                "type": "mixed",
+                "listen": "127.0.0.1",
+                "listen_port": 10808
+              }
+            ],
+            "outbounds": [
+              {
+                "type": "hysteria2",
+                "server": "${{ secrets.PROXY_SERVER }}",
+                "server_port": ${{ secrets.PROXY_PORT }},
+                "password": "${{ secrets.PROXY_PASSWORD }}",
+                "tls": {
+                  "enabled": true,
+                  "server_name": "${{ secrets.PROXY_SNI }}",
+                  "insecure": true
+                }
+              }
+            ]
+          }
+          EOF
+
+          # Start sing-box in background
+          nohup sing-box run -c /tmp/sing-box.json > /tmp/sing-box.log 2>&1 &
+          sleep 5
+          echo "Sing-box started"
+          cat /tmp/sing-box.log || true
 
       - name: Run renewal
         run: xvfb-run -a python zampto_auto_renew.py once
