@@ -2,13 +2,12 @@ name: Zampto Auto Renew
 
 on:
   schedule:
-    # 每小时运行一次（UTC 时间，整点过5分）
     - cron: '5 * * * *'
   workflow_dispatch:
-    # 允许手动触发
 
 env:
   BROWSER_MODE: playwright
+  HEADLESS: "false"
   ZAMPTO_EMAIL: ${{ secrets.ZAMPTO_EMAIL }}
   ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
   SERVER_IDS: ${{ secrets.SERVER_IDS }}
@@ -29,12 +28,14 @@ jobs:
 
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
           pip install playwright
           playwright install chromium
           playwright install-deps chromium
 
       - name: Run renewal
-        run: python zampto_auto_renew.py once
+        run: xvfb-run -a python zampto_auto_renew.py once
 
       - name: Upload screenshots
         if: always()
